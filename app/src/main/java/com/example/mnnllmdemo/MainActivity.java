@@ -8,7 +8,8 @@ import static com.example.mnnllmdemo.GLRender.executorService;
 import static com.example.mnnllmdemo.GLRender.focus_area;
 import static com.example.mnnllmdemo.GLRender.run_depth;
 import static com.example.mnnllmdemo.GLRender.run_yolo;
-
+import com.example.mnnllmdemo.llm.LlmSimpleClient;
+import com.example.mnnllmdemo.llm.DetResultReporter;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.content.Context;
@@ -93,6 +94,7 @@ public class MainActivity extends AppCompatActivity {
         }
         setWindowFlag();
         initView();
+        LlmSimpleClient.INSTANCE.init(getApplicationContext());
     }
 
     private void setWindowFlag() {
@@ -195,6 +197,40 @@ public class MainActivity extends AppCompatActivity {
                         FPS_view.setText("FPS: " + String.format("%.1f", FPS));
                         depth_view.setText("Central\nDepth: " + String.format("%.2f", central_depth) + " m");
                         class_view.setText(class_result);
+                        String snapshot = class_result.toString();
+                        class_view.setText(snapshot);
+
+                        // === 新增：把这一帧的每一行喂给 DDetResultReporter ===
+                        if (!snapshot.isEmpty()) {
+                            String[] lines = snapshot.split("\\n");
+                            for (String line : lines) {
+                                line = line.trim();
+                                if (line.isEmpty()) continue;
+                                // 你的格式是 "label / 95.3% / 1.2 m"
+                                try {
+                                    String[] segs = line.split("/");
+                                    String label = segs[0].trim();
+
+                                    float score = 0f;
+                                    if (segs.length > 1) {
+                                        String s = segs[1].replace("%","").trim();
+                                        score = Float.parseFloat(s) / 100f;
+                                    }
+
+                                    float depthMeters = 0f;
+                                    if (segs.length > 2) {
+                                        String d = segs[2].replace("m","").trim();
+                                        depthMeters = Float.parseFloat(d);
+                                    }
+
+                                    // 把“解析后的单条结果”喂给 Reporter
+                                    DetResultReporter.INSTANCE.offer(label, score, depthMeters);
+
+                                } catch (Throwable ignore) {
+                                    // 单行解析失败就忽略，避免影响整帧
+                                }
+                            }
+                        }
                         class_result.setLength(0);
                     });
                 });
