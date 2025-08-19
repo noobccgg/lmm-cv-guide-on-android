@@ -69,6 +69,7 @@ public class MainActivity extends AppCompatActivity {
         System.loadLibrary("mnnllmdemo");
     }
 
+
     @SuppressLint("SetTextI18n")
     @Override
     protected void onCreate(Bundle savedInstanceState) {

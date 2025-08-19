@@ -6,7 +6,7 @@ import static com.example.mnnllmdemo.MainActivity.Run_Depth;
 import static com.example.mnnllmdemo.MainActivity.Run_YOLO;
 import static com.example.mnnllmdemo.MainActivity.class_result;
 import static com.example.mnnllmdemo.MainActivity.labels;
-
+import android.os.SystemClock;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.res.AssetManager;
@@ -98,6 +98,11 @@ public class GLRender implements GLSurfaceView.Renderer {
     private static final String yolo_vertex_shader_name = "yolo_vertex_shader.glsl";
     private static final String yolo_fragment_shader_name = "yolo_fragment_shader.glsl";
     public static SurfaceTexture mSurfaceTexture;
+
+    private static final long YOLO_COOLDOWN_MS  = 300;  // 每 300ms 才允许触发一次 YOLO
+    private static final long DEPTH_COOLDOWN_MS = 500;  // 每 500ms 才允许触发一次 Depth
+    private static long lastYoloTs  = 0L;
+    private static long lastDepthTs = 0L;
     public static boolean run_yolo = true;                                                  // true for turn on the function.
     public static boolean run_depth = true;                                                // true for turn on the function. Enabling both YOLO and depth estimation simultaneously decrease performance by 30+%.
     private static final LinkedList<LinkedList<Classifier.Recognition>> draw_queue_yolo = new LinkedList<>();
@@ -146,12 +151,14 @@ public class GLRender implements GLSurfaceView.Renderer {
     }
     @Override
     public void onDrawFrame(GL10 gl) {
+        final long now = android.os.SystemClock.uptimeMillis();
+
         mSurfaceTexture.updateTexImage();
         mSurfaceTexture.getTransformMatrix(vMatrix);
-        Draw_Camera_Preview();
+//        Draw_Camera_Preview();
         if (!run_yolo && !run_depth) {
             imageRGBA = Process_Texture();
-            // Choose CPU normalization over GPU, as GPU float32 buffer access is much slower than int8 buffer access. 
+            // Choose CPU normalization over GPU, as GPU float32 buffer access is much slower than int8 buffer access.
             // Therefore, use a new thread to parallelize the normalization process.
             executorService.execute(() -> {
                 for (int i = 0; i < camera_pixels_half; i++) {
@@ -170,7 +177,7 @@ public class GLRender implements GLSurfaceView.Renderer {
                 }
             });
         }
-        if (run_yolo) {
+        if (run_yolo && (now - lastYoloTs) >= YOLO_COOLDOWN_MS) {
             run_yolo = false;
             executorService.execute(() -> {
                 long t = System.currentTimeMillis();
@@ -185,7 +192,7 @@ public class GLRender implements GLSurfaceView.Renderer {
                 run_yolo = true;
             });
         }
-        if (run_depth) {
+        if (run_depth && (now - lastDepthTs) >= DEPTH_COOLDOWN_MS) {
             run_depth = false;
             executorService.execute(() -> {
                 depth_results = Run_Depth(pixel_values);

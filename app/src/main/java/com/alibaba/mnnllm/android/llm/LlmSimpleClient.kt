@@ -16,10 +16,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
- * 轻量封装：全局驻留一个 LlmSession + 流式TTS。
+ * 全局：1个 LlmSession + 流式 TTS。
+ *
  * - init(context)：一次性初始化（拷贝模型、加载会话、初始化TTS）
- * - ask(question, systemPrompt?, speak)：带系统prompt地发问，并可实时播报
- * - setSystemPrompt(p)：动态修改系统prompt
+ * - setSystemPrompt(p)：更新系统 Prompt（影响后续 ask）
+ * - ask(question, systemPromptOverride?, speak=true)：提问，可选覆盖 system；支持流式边播报
  * - release()：释放
  */
 object LlmSimpleClient {
@@ -31,27 +32,25 @@ object LlmSimpleClient {
     @Volatile private var session: LlmSession? = null
     private val inited = AtomicBoolean(false)
 
-    // System prompt 可动态修改
+    // 可动态修改的 system prompt
     @Volatile private var systemPrompt: String = DEFAULT_SYSTEM
 
-    // 语音相关
+    // 语音
     private var ttsSpeaker: TtsSpeaker? = null
     private val ttsCollector = StreamingTtsCollector()
 
-    /** 只初始化一次；建议在 Application.onCreate 调用 */
+    /** 只初始化一次（线程安全，失败会回滚 inited 标志） */
     fun init(context: Context) {
-        if (inited.get()) return
-        synchronized(this) {
-            if (inited.get()) return
-
+        if (!inited.compareAndSet(false, true)) return
+        try {
             val appCtx = context.applicationContext
 
-            // 1) 拷贝 assets → 内部目录
+            // 1) 拷贝模型目录
             val localModelDir = File(appCtx.filesDir, MODEL_DIR_IN_ASSETS)
             AssetUtils.ensureAssetDirCopied(appCtx, MODEL_DIR_IN_ASSETS, localModelDir)
             Log.d(TAG, "Assets copied to: ${localModelDir.absolutePath}")
 
-            // 2) 初始化 TTS（一次即可）
+            // 2) 初始化 TTS（幂等）
             try {
                 TtsEngine.init(appCtx)
                 ttsSpeaker = TtsSpeaker(appCtx)
@@ -71,20 +70,25 @@ object LlmSimpleClient {
                 setKeepHistory(false)
                 setHistory(null)
                 load()
-                updateAssistantPrompt(ASSISTANT_PROMPT)
+                updateAssistantPrompt(ASSISTANT_PROMPT) // 只影响 assistant 格式，不是 system
             }
             Log.d(TAG, "LLM session loaded.")
-
-            inited.set(true)
+        } catch (t: Throwable) {
+            inited.set(false) // 失败回滚
+            throw t
         }
     }
 
-    /** 可随时修改系统 prompt（影响后续 ask） */
-    fun setSystemPrompt(p: String) { systemPrompt = p }
+    /** 动态更新 system prompt（生效于后续 ask） */
+    fun setSystemPrompt(p: String) {
+        systemPrompt = p
+    }
 
     /**
-     * 传入用户问题；可指定临时的systemPrompt与是否播报。
-     * - speak=true：边流式生成边播报
+     * 进行一次问答。
+     * @param question 用户输入
+     * @param systemPromptOverride 临时覆盖 system（可空）
+     * @param speak 是否边流式生成边播报
      */
     fun ask(question: String, systemPromptOverride: String? = null, speak: Boolean = true) {
         val s = session
@@ -92,33 +96,31 @@ object LlmSimpleClient {
             Log.e(TAG, "ask() called before init().")
             return
         }
-
         val sys = (systemPromptOverride ?: systemPrompt).ifBlank { DEFAULT_SYSTEM }
 
+        // 便于排查：打印这次真正生效的 system & user
         val pretty = buildString {
             appendLine("下面是一次对话：")
             appendLine("【system】$sys")
             appendLine("【user】$question")
         }
-        Log.d(TAG, "---- LLM question start ----\n$pretty\n---- LLM question end ----")
+        Log.d(TAG, "---- LLM question start ----\n$pretty---- LLM question end ----")
 
-        // 监听器：过滤<think>并实时分句
+        // 过滤<think> + 分句回调
         val listener = object : SafeProgressListener() {
             override fun onProgressNullable(token: String?): Boolean {
                 if (token.isNullOrEmpty()) return false
                 val clean = sanitizeThink(token)
                 if (clean.isEmpty()) return false
 
-                // 日志看流式片段
                 Log.d(TAG, clean)
 
-                // 分句 -> TTS
                 if (speak) {
                     ttsCollector.push(clean) { sentence ->
                         if (sentence.isNotBlank()) ttsSpeaker?.speak(sentence)
                     }
                 }
-                return false // 必须返回 false，继续生成
+                return false // 返回 false 继续生成
             }
 
             override fun onComplete() {
@@ -127,7 +129,7 @@ object LlmSimpleClient {
                         if (sentence.isNotBlank()) ttsSpeaker?.speak(sentence)
                     }
                 }
-                Log.d(TAG, "\n[LLM Complete]")
+                Log.d(TAG, "[LLM Complete]")
             }
 
             override fun onError(message: String) {
@@ -140,13 +142,14 @@ object LlmSimpleClient {
                 "system" to sys,
                 "user" to question
             )
+            // 注意：这是阻塞调用；建议在后台线程调用（你已在 DetResultReporter 里后台执行）
             s.generateFromMessages(messages, listener)
         } catch (e: Throwable) {
             Log.e(TAG, "LLM exception: ${e.message}", e)
         }
     }
 
-    /** 退出时可调用一次 */
+    /** 可在退出时调用 */
     fun release() {
         try { session?.release() } catch (_: Throwable) {}
         session = null
@@ -156,7 +159,7 @@ object LlmSimpleClient {
         Log.d(TAG, "LLM session released.")
     }
 
-    // ============== 辅助：过滤<think>并按句号切片给TTS ==============
+    // ============== 过滤<think>并按句号/换行切片给TTS ==============
 
     private class StreamingTtsCollector {
         private val sb = StringBuilder()
@@ -212,7 +215,7 @@ object LlmSimpleClient {
         }
     }
 
-    /** 对外也可重用的简易过滤 */
+    /** 简易过滤（对外复用） */
     private fun sanitizeThink(input: String): String {
         var s = input
         while (true) {
@@ -224,7 +227,7 @@ object LlmSimpleClient {
         return s
     }
 
-    /** 串行 TTS 播放器 + 音频焦点 */
+    /** 串行 TTS 播放器 + 音频焦点（只启动一次 worker 线程） */
     private class TtsSpeaker(ctx: Context) {
         private val queue = LinkedBlockingQueue<String>()
         private val workerStarted = AtomicBoolean(false)
@@ -268,6 +271,7 @@ object LlmSimpleClient {
                             }
                         }
                     } catch (_: InterruptedException) {
+                        // exit
                     } finally {
                         abandonFocus()
                     }
